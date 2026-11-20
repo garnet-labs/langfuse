@@ -1,0 +1,160 @@
+name: Garnet Runtime Visibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dep-install:
+    name: Dependency install (recorded)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
+        with:
+          debug: "true"
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install dependencies (lifecycle scripts execute here)
+        run: pnpm install --no-frozen-lockfile
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
+
+  cargo-install:
+    name: Cargo build (${{ matrix.directory }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: [ai-gateway, packages/native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
+      - name: Resolve repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Fetch and build locked dependencies
+        if: matrix.directory == 'ai-gateway'
+        run: cargo fetch --locked && cargo build --locked
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+        if: matrix.directory == 'packages/native'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: matrix.directory == 'packages/native'
+        with:
+          node-version-file: .nvmrc
+      # Native lint mirrors pipeline.yml and allows its patched crate to update resolution.
+      - name: Lint native addon (rustfmt, clippy)
+        if: matrix.directory == 'packages/native'
+        working-directory: .
+        run: pnpm --filter @langfuse/native run lint
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
+
+  dependency-proof:
+    name: Dependency proof
+    needs: [dep-install, cargo-install]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      INSTALL_RESULT: ${{ needs.dep-install.result }}
+      CARGO_RESULT: ${{ needs.cargo-install.result }}
+    steps:
+      - name: Attest only complete current-head evidence
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+
+          def api(path):
+              return json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp", path], text=True))
+
+          if os.environ["INSTALL_RESULT"] != "success" or os.environ["CARGO_RESULT"] != "success":
+              print("no attestation: a recorded workload did not succeed")
+              raise SystemExit(0)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          number = os.environ["PR_NUMBER"]
+          head = os.environ["HEAD_SHA"]
+          files = [row["filename"] for page in api(f"repos/{repo}/pulls/{number}/files?per_page=100") for row in page]
+          if any(path.startswith((".github/workflows/", ".github/merge-gate/", ".stamphog/", "tools/pr-approval-agent/")) for path in files):
+              print("no attestation: this change edits the proof or its trusted inputs")
+              raise SystemExit(0)
+          supported = re.compile(r"^(pnpm-lock\.yaml|pnpm-workspace\.yaml|\.nvmrc|package\.json|(web|worker|packages/[^/]+)/package\.json|(ai-gateway|packages/native)/(Cargo\.(toml|lock)|rust-toolchain\.toml))$")
+          judged = [path for path in files if supported.fullmatch(path)]
+          if not judged:
+              print("no attestation: no supported dependency paths")
+              raise SystemExit(0)
+          marker = re.compile(r"<!--\s*garnet:summary\s+(\{.*?\})\s*-->", re.S)
+          for attempt in range(40):
+              comments = [row for page in api(f"repos/{repo}/issues/{number}/comments?per_page=100") for row in page]
+              records = [row["body"] for row in comments if row["user"]["login"] == "garnet-runtime-review[bot]" and marker.search(row["body"])]
+              if len(records) == 1:
+                  body = records[0]
+                  try:
+                      summary = json.loads(marker.search(body).group(1))
+                  except (ValueError, AttributeError):
+                      summary = {}
+                  if summary.get("commit") == head and summary.get("status") == "finalized":
+                      valid = (
+                          f"<!-- garnet:commit {head} -->" in body
+                          and summary.get("capture_quality") == "complete"
+                          and type(summary.get("incomplete")) is int
+                          and summary["incomplete"] == 0
+                          and summary.get("outcome") == "unchanged"
+                          and summary.get("previous") == os.environ["BASE_SHA"]
+                          and type(summary.get("jobs")) is int
+                          and summary["jobs"] == 3
+                          and f"/actions/runs/{os.environ['GITHUB_RUN_ID']}" in body
+                      )
+                      if valid:
+                          paths = json.dumps(judged, separators=(",", ":"))
+                          print(f"::notice title=stamphog attestation: {os.environ['BASE_REF']}::<!-- stamphog:v1 {paths} -->")
+                      else:
+                          print("no attestation: evidence is not complete and comparable for all recorded workloads")
+                      break
+              print(f"attempt {attempt + 1}: no unique finalized current-head record")
+              time.sleep(30)
+          else:
+              print("no attestation: current-head evidence did not finalize")
