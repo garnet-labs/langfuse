@@ -62,7 +62,19 @@ jobs:
       - name: Resolve repository Rust toolchain
         run: rustup show active-toolchain
       - name: Fetch and build locked dependencies
+        if: matrix.directory == 'ai-gateway'
         run: cargo fetch --locked && cargo build --locked
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+        if: matrix.directory == 'packages/native'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: matrix.directory == 'packages/native'
+        with:
+          node-version-file: .nvmrc
+      # Native lint mirrors pipeline.yml and allows its patched crate to update resolution.
+      - name: Lint native addon (rustfmt, clippy)
+        if: matrix.directory == 'packages/native'
+        working-directory: .
+        run: pnpm --filter @langfuse/native run lint
       - name: Let sensor settle
         if: always()
         run: sleep 30
